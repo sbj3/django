@@ -58,10 +58,6 @@ def add_lazy_relation(cls, field, relation, operation):
             # If we can't split, assume a model in current app
             app_label = cls._meta.app_label
             model_name = relation
-        except AttributeError:
-            # If it doesn't have a split it's actually a model class
-            app_label = relation._meta.app_label
-            model_name = relation._meta.object_name
 
     # Try to look up the related model, and if it's already loaded resolve the
     # string right away. If get_model returns None, it means that the related
@@ -100,7 +96,7 @@ class RelatedField(object):
             self.rel.related_name = self.rel.related_name % {'class': cls.__name__.lower()}
 
         other = self.rel.to
-        if isinstance(other, basestring) or other._meta.pk is None:
+        if isinstance(other, basestring):
             def resolve_related_class(field, model, cls):
                 field.rel.to = model
                 field.do_related_class(model, cls)
@@ -405,22 +401,22 @@ class ForeignRelatedObjectsDescriptor(object):
 
         return manager
 
-def create_many_related_manager(superclass, rel=False):
+def create_many_related_manager(superclass, through=False):
     """Creates a manager that subclasses 'superclass' (which is a Manager)
     and adds behavior for many-to-many related objects."""
-    through = rel.through
     class ManyRelatedManager(superclass):
         def __init__(self, model=None, core_filters=None, instance=None, symmetrical=None,
-                join_table=None, source_field_name=None, target_field_name=None):
+                join_table=None, source_col_name=None, target_col_name=None):
             super(ManyRelatedManager, self).__init__()
             self.core_filters = core_filters
             self.model = model
             self.symmetrical = symmetrical
             self.instance = instance
-            self.source_field_name = source_field_name
-            self.target_field_name = target_field_name
+            self.join_table = join_table
+            self.source_col_name = source_col_name
+            self.target_col_name = target_col_name
             self.through = through
-            self._pk_val = self.instance.pk
+            self._pk_val = self.instance._get_pk_val()
             if self._pk_val is None:
                 raise ValueError("%r instance needs to have a primary key value before a many-to-many relationship can be used." % instance.__class__.__name__)
 
@@ -429,37 +425,36 @@ def create_many_related_manager(superclass, rel=False):
 
         # If the ManyToMany relation has an intermediary model,
         # the add and remove methods do not exist.
-        if rel.through._meta.auto_created:
+        if through is None:
             def add(self, *objs):
-                self._add_items(self.source_field_name, self.target_field_name, *objs)
+                self._add_items(self.source_col_name, self.target_col_name, *objs)
 
                 # If this is a symmetrical m2m relation to self, add the mirror entry in the m2m table
                 if self.symmetrical:
-                    self._add_items(self.target_field_name, self.source_field_name, *objs)
+                    self._add_items(self.target_col_name, self.source_col_name, *objs)
             add.alters_data = True
 
             def remove(self, *objs):
-                self._remove_items(self.source_field_name, self.target_field_name, *objs)
+                self._remove_items(self.source_col_name, self.target_col_name, *objs)
 
                 # If this is a symmetrical m2m relation to self, remove the mirror entry in the m2m table
                 if self.symmetrical:
-                    self._remove_items(self.target_field_name, self.source_field_name, *objs)
+                    self._remove_items(self.target_col_name, self.source_col_name, *objs)
             remove.alters_data = True
 
         def clear(self):
-            self._clear_items(self.source_field_name)
+            self._clear_items(self.source_col_name)
 
             # If this is a symmetrical m2m relation to self, clear the mirror entry in the m2m table
             if self.symmetrical:
-                self._clear_items(self.target_field_name)
+                self._clear_items(self.target_col_name)
         clear.alters_data = True
 
         def create(self, **kwargs):
             # This check needs to be done here, since we can't later remove this
             # from the method lookup table, as we do with add and remove.
-            if not rel.through._meta.auto_created:
-                opts = through._meta
-                raise AttributeError, "Cannot use create() on a ManyToManyField which specifies an intermediary model. Use %s.%s's Manager instead." % (opts.app_label, opts.object_name)
+            if through is not None:
+                raise AttributeError, "Cannot use create() on a ManyToManyField which specifies an intermediary model. Use %s's Manager instead." % through
             new_obj = super(ManyRelatedManager, self).create(**kwargs)
             self.add(new_obj)
             return new_obj
@@ -475,38 +470,41 @@ def create_many_related_manager(superclass, rel=False):
             return obj, created
         get_or_create.alters_data = True
 
-        def _add_items(self, source_field_name, target_field_name, *objs):
+        def _add_items(self, source_col_name, target_col_name, *objs):
             # join_table: name of the m2m link table
-            # source_field_name: the PK fieldname in join_table for the source object
-            # target_col_name: the PK fieldname in join_table for the target object
+            # source_col_name: the PK colname in join_table for the source object
+            # target_col_name: the PK colname in join_table for the target object
             # *objs - objects to add. Either object instances, or primary keys of object instances.
 
             # If there aren't any objects, there is nothing to do.
-            from django.db.models import Model
             if objs:
+                from django.db.models.base import Model
+                # Check that all the objects are of the right type
                 new_ids = set()
                 for obj in objs:
                     if isinstance(obj, self.model):
-                        new_ids.add(obj.pk)
+                        new_ids.add(obj._get_pk_val())
                     elif isinstance(obj, Model):
                         raise TypeError, "'%s' instance expected" % self.model._meta.object_name
                     else:
                         new_ids.add(obj)
-                vals = self.through._default_manager.values_list(target_field_name, flat=True)
-                vals = vals.filter(**{
-                    source_field_name: self._pk_val,
-                    '%s__in' % target_field_name: new_ids,
-                })
-                vals = set(vals)
+                # Add the newly created or already existing objects to the join table.
+                # First find out which items are already added, to avoid adding them twice
+                cursor = connection.cursor()
+                cursor.execute("SELECT %s FROM %s WHERE %s = %%s AND %s IN (%s)" % \
+                    (target_col_name, self.join_table, source_col_name,
+                    target_col_name, ",".join(['%s'] * len(new_ids))),
+                    [self._pk_val] + list(new_ids))
+                existing_ids = set([row[0] for row in cursor.fetchall()])
 
                 # Add the ones that aren't there already
-                for obj_id in (new_ids - vals):
-                    self.through._default_manager.create(**{
-                        '%s_id' % source_field_name: self._pk_val,
-                        '%s_id' % target_field_name: obj_id,
-                    })
+                for obj_id in (new_ids - existing_ids):
+                    cursor.execute("INSERT INTO %s (%s, %s) VALUES (%%s, %%s)" % \
+                        (self.join_table, source_col_name, target_col_name),
+                        [self._pk_val, obj_id])
+                transaction.commit_unless_managed()
 
-        def _remove_items(self, source_field_name, target_field_name, *objs):
+        def _remove_items(self, source_col_name, target_col_name, *objs):
             # source_col_name: the PK colname in join_table for the source object
             # target_col_name: the PK colname in join_table for the target object
             # *objs - objects to remove
@@ -517,20 +515,24 @@ def create_many_related_manager(superclass, rel=False):
                 old_ids = set()
                 for obj in objs:
                     if isinstance(obj, self.model):
-                        old_ids.add(obj.pk)
+                        old_ids.add(obj._get_pk_val())
                     else:
                         old_ids.add(obj)
                 # Remove the specified objects from the join table
-                self.through._default_manager.filter(**{
-                    source_field_name: self._pk_val,
-                    '%s__in' % target_field_name: old_ids
-                }).delete()
+                cursor = connection.cursor()
+                cursor.execute("DELETE FROM %s WHERE %s = %%s AND %s IN (%s)" % \
+                    (self.join_table, source_col_name,
+                    target_col_name, ",".join(['%s'] * len(old_ids))),
+                    [self._pk_val] + list(old_ids))
+                transaction.commit_unless_managed()
 
-        def _clear_items(self, source_field_name):
+        def _clear_items(self, source_col_name):
             # source_col_name: the PK colname in join_table for the source object
-            self.through._default_manager.filter(**{
-                source_field_name: self._pk_val
-            }).delete()
+            cursor = connection.cursor()
+            cursor.execute("DELETE FROM %s WHERE %s = %%s" % \
+                (self.join_table, source_col_name),
+                [self._pk_val])
+            transaction.commit_unless_managed()
 
     return ManyRelatedManager
 
@@ -552,15 +554,17 @@ class ManyRelatedObjectsDescriptor(object):
         # model's default manager.
         rel_model = self.related.model
         superclass = rel_model._default_manager.__class__
-        RelatedManager = create_many_related_manager(superclass, self.related.field.rel)
+        RelatedManager = create_many_related_manager(superclass, self.related.field.rel.through)
 
+        qn = connection.ops.quote_name
         manager = RelatedManager(
             model=rel_model,
             core_filters={'%s__pk' % self.related.field.name: instance._get_pk_val()},
             instance=instance,
             symmetrical=False,
-            source_field_name=self.related.field.m2m_reverse_field_name(),
-            target_field_name=self.related.field.m2m_field_name()
+            join_table=qn(self.related.field.m2m_db_table()),
+            source_col_name=qn(self.related.field.m2m_reverse_name()),
+            target_col_name=qn(self.related.field.m2m_column_name())
         )
 
         return manager
@@ -569,9 +573,9 @@ class ManyRelatedObjectsDescriptor(object):
         if instance is None:
             raise AttributeError, "Manager must be accessed via instance"
 
-        if not self.related.field.rel.through._meta.auto_created:
-            opts = self.related.field.rel.through._meta
-            raise AttributeError, "Cannot set values on a ManyToManyField which specifies an intermediary model. Use %s.%s's Manager instead." % (opts.app_label, opts.object_name)
+        through = getattr(self.related.field.rel, 'through', None)
+        if through is not None:
+            raise AttributeError, "Cannot set values on a ManyToManyField which specifies an intermediary model. Use %s's Manager instead." % through
 
         manager = self.__get__(instance)
         manager.clear()
@@ -587,13 +591,6 @@ class ReverseManyRelatedObjectsDescriptor(object):
     def __init__(self, m2m_field):
         self.field = m2m_field
 
-    def _through(self):
-        # through is provided so that you have easy access to the through
-        # model (Book.authors.through) for inlines, etc. This is done as
-        # a property to ensure that the fully resolved value is returned.
-        return self.field.rel.through
-    through = property(_through)
-
     def __get__(self, instance, instance_type=None):
         if instance is None:
             return self
@@ -602,15 +599,17 @@ class ReverseManyRelatedObjectsDescriptor(object):
         # model's default manager.
         rel_model=self.field.rel.to
         superclass = rel_model._default_manager.__class__
-        RelatedManager = create_many_related_manager(superclass, self.field.rel)
+        RelatedManager = create_many_related_manager(superclass, self.field.rel.through)
 
+        qn = connection.ops.quote_name
         manager = RelatedManager(
             model=rel_model,
             core_filters={'%s__pk' % self.field.related_query_name(): instance._get_pk_val()},
             instance=instance,
             symmetrical=(self.field.rel.symmetrical and isinstance(instance, rel_model)),
-            source_field_name=self.field.m2m_field_name(),
-            target_field_name=self.field.m2m_reverse_field_name()
+            join_table=qn(self.field.m2m_db_table()),
+            source_col_name=qn(self.field.m2m_column_name()),
+            target_col_name=qn(self.field.m2m_reverse_name())
         )
 
         return manager
@@ -619,9 +618,9 @@ class ReverseManyRelatedObjectsDescriptor(object):
         if instance is None:
             raise AttributeError, "Manager must be accessed via instance"
 
-        if not self.field.rel.through._meta.auto_created:
-            opts = self.field.rel.through._meta
-            raise AttributeError, "Cannot set values on a ManyToManyField which specifies an intermediary model.  Use %s.%s's Manager instead." % (opts.app_label, opts.object_name)
+        through = getattr(self.field.rel, 'through', None)
+        if through is not None:
+            raise AttributeError, "Cannot set values on a ManyToManyField which specifies an intermediary model.  Use %s's Manager instead." % through
 
         manager = self.__get__(instance)
         manager.clear()
@@ -642,10 +641,6 @@ class ManyToOneRel(object):
         self.lookup_overrides = lookup_overrides or {}
         self.multiple = True
         self.parent_link = parent_link
-
-    def is_hidden(self):
-        "Should the related object be hidden?"
-        return self.related_name and self.related_name[-1] == '+'
 
     def get_related_field(self):
         """
@@ -678,10 +673,6 @@ class ManyToManyRel(object):
         self.multiple = True
         self.through = through
 
-    def is_hidden(self):
-        "Should the related object be hidden?"
-        return self.related_name and self.related_name[-1] == '+'
-
     def get_related_field(self):
         """
         Returns the field in the to' object to which this relationship is tied
@@ -699,10 +690,7 @@ class ForeignKey(RelatedField, Field):
             assert isinstance(to, basestring), "%s(%r) is invalid. First parameter to ForeignKey must be either a model, a model name, or the string %r" % (self.__class__.__name__, to, RECURSIVE_RELATIONSHIP_CONSTANT)
         else:
             assert not to._meta.abstract, "%s cannot define a relation with abstract class %s" % (self.__class__.__name__, to._meta.object_name)
-            # For backwards compatibility purposes, we need to *try* and set
-            # the to_field during FK construction. It won't be guaranteed to
-            # be correct until contribute_to_class is called. Refs #12190.
-            to_field = to_field or (to._meta.pk and to._meta.pk.name)
+            to_field = to_field or to._meta.pk.name
         kwargs['verbose_name'] = kwargs.get('verbose_name', None)
 
         kwargs['rel'] = rel_class(to, to_field,
@@ -755,12 +743,7 @@ class ForeignKey(RelatedField, Field):
         cls._meta.duplicate_targets[self.column] = (target, "o2m")
 
     def contribute_to_related_class(self, cls, related):
-        # Internal FK's - i.e., those with a related name ending with '+' -
-        # don't get a related descriptor.
-        if not self.rel.is_hidden():
-            setattr(cls, related.get_accessor_name(), ForeignRelatedObjectsDescriptor(related))
-        if self.rel.field_name is None:
-            self.rel.field_name = cls._meta.pk.name
+        setattr(cls, related.get_accessor_name(), ForeignRelatedObjectsDescriptor(related))
 
     def formfield(self, **kwargs):
         defaults = {
@@ -807,45 +790,6 @@ class OneToOneField(ForeignKey):
             return None
         return super(OneToOneField, self).formfield(**kwargs)
 
-def create_many_to_many_intermediary_model(field, klass):
-    from django.db import models
-    managed = True
-    if isinstance(field.rel.to, basestring) and field.rel.to != RECURSIVE_RELATIONSHIP_CONSTANT:
-        to = field.rel.to
-        to_model = field.rel.to
-        def set_managed(field, model, cls):
-            field.rel.through._meta.managed = model._meta.managed or cls._meta.managed
-        add_lazy_relation(klass, field, to_model, set_managed)
-    elif isinstance(field.rel.to, basestring):
-        to = klass._meta.object_name
-        to_model = klass
-        managed = klass._meta.managed
-    else:
-        to = field.rel.to._meta.object_name
-        to_model = field.rel.to
-        managed = klass._meta.managed or to_model._meta.managed
-    name = '%s_%s' % (klass._meta.object_name, field.name)
-    if field.rel.to == RECURSIVE_RELATIONSHIP_CONSTANT or field.rel.to == klass._meta.object_name:
-        from_ = 'from_%s' % to.lower()
-        to = 'to_%s' % to.lower()
-    else:
-        from_ = klass._meta.object_name.lower()
-        to = to.lower()
-    meta = type('Meta', (object,), {
-        'db_table': field._get_m2m_db_table(klass._meta),
-        'managed': managed,
-        'auto_created': klass,
-        'app_label': klass._meta.app_label,
-        'unique_together': (from_, to)
-    })
-    # Construct and return the new class.
-    return type(name, (models.Model,), {
-        'Meta': meta,
-        '__module__': klass.__module__,
-        from_: models.ForeignKey(klass, related_name='%s+' % name),
-        to: models.ForeignKey(to_model, related_name='%s+' % name)
-    })
-
 class ManyToManyField(RelatedField, Field):
     def __init__(self, to, **kwargs):
         try:
@@ -862,7 +806,10 @@ class ManyToManyField(RelatedField, Field):
 
         self.db_table = kwargs.pop('db_table', None)
         if kwargs['rel'].through is not None:
+            self.creates_table = False
             assert self.db_table is None, "Cannot specify a db_table if an intermediary model is used."
+        else:
+            self.creates_table = True
 
         Field.__init__(self, **kwargs)
 
@@ -875,45 +822,62 @@ class ManyToManyField(RelatedField, Field):
     def _get_m2m_db_table(self, opts):
         "Function that can be curried to provide the m2m table name for this relation"
         if self.rel.through is not None:
-            return self.rel.through._meta.db_table
+            return self.rel.through_model._meta.db_table
         elif self.db_table:
             return self.db_table
         else:
             return util.truncate_name('%s_%s' % (opts.db_table, self.name),
                                       connection.ops.max_name_length())
 
-    def _get_m2m_attr(self, related, attr):
+    def _get_m2m_column_name(self, related):
         "Function that can be curried to provide the source column name for the m2m table"
-        cache_attr = '_m2m_%s_cache' % attr
-        if hasattr(self, cache_attr):
-            return getattr(self, cache_attr)
-        for f in self.rel.through._meta.fields:
-            if hasattr(f,'rel') and f.rel and f.rel.to == related.model:
-                setattr(self, cache_attr, getattr(f, attr))
-                return getattr(self, cache_attr)
-
-    def _get_m2m_reverse_attr(self, related, attr):
-        "Function that can be curried to provide the related column name for the m2m table"
-        cache_attr = '_m2m_reverse_%s_cache' % attr
-        if hasattr(self, cache_attr):
-            return getattr(self, cache_attr)
-        found = False
-        for f in self.rel.through._meta.fields:
-            if hasattr(f,'rel') and f.rel and f.rel.to == related.parent_model:
-                if related.model == related.parent_model:
-                    # If this is an m2m-intermediate to self,
-                    # the first foreign key you find will be
-                    # the source column. Keep searching for
-                    # the second foreign key.
-                    if found:
-                        setattr(self, cache_attr, getattr(f, attr))
+        try:
+            return self._m2m_column_name_cache
+        except:
+            if self.rel.through is not None:
+                for f in self.rel.through_model._meta.fields:
+                    if hasattr(f,'rel') and f.rel and f.rel.to == related.model:
+                        self._m2m_column_name_cache = f.column
                         break
-                    else:
-                        found = True
-                else:
-                    setattr(self, cache_attr, getattr(f, attr))
-                    break
-        return getattr(self, cache_attr)
+            # If this is an m2m relation to self, avoid the inevitable name clash
+            elif related.model == related.parent_model:
+                self._m2m_column_name_cache = 'from_' + related.model._meta.object_name.lower() + '_id'
+            else:
+                self._m2m_column_name_cache = related.model._meta.object_name.lower() + '_id'
+
+            # Return the newly cached value
+            return self._m2m_column_name_cache
+
+    def _get_m2m_reverse_name(self, related):
+        "Function that can be curried to provide the related column name for the m2m table"
+        try:
+            return self._m2m_reverse_name_cache
+        except:
+            if self.rel.through is not None:
+                found = False
+                for f in self.rel.through_model._meta.fields:
+                    if hasattr(f,'rel') and f.rel and f.rel.to == related.parent_model:
+                        if related.model == related.parent_model:
+                            # If this is an m2m-intermediate to self,
+                            # the first foreign key you find will be
+                            # the source column. Keep searching for
+                            # the second foreign key.
+                            if found:
+                                self._m2m_reverse_name_cache = f.column
+                                break
+                            else:
+                                found = True
+                        else:
+                            self._m2m_reverse_name_cache = f.column
+                            break
+            # If this is an m2m relation to self, avoid the inevitable name clash
+            elif related.model == related.parent_model:
+                self._m2m_reverse_name_cache = 'to_' + related.parent_model._meta.object_name.lower() + '_id'
+            else:
+                self._m2m_reverse_name_cache = related.parent_model._meta.object_name.lower() + '_id'
+
+            # Return the newly cached value
+            return self._m2m_reverse_name_cache
 
     def isValidIDList(self, field_data, all_data):
         "Validates that the value is a valid list of foreign keys"
@@ -955,17 +919,10 @@ class ManyToManyField(RelatedField, Field):
         # specify *what* on my non-reversible relation?!"), so we set it up
         # automatically. The funky name reduces the chance of an accidental
         # clash.
-        if self.rel.symmetrical and (self.rel.to == "self" or self.rel.to == cls._meta.object_name):
+        if self.rel.symmetrical and self.rel.to == "self" and self.rel.related_name is None:
             self.rel.related_name = "%s_rel_+" % name
 
         super(ManyToManyField, self).contribute_to_class(cls, name)
-
-        # The intermediate m2m model is not auto created if:
-        #  1) There is a manually specified intermediate, or
-        #  2) The class owning the m2m field is abstract.
-        if not self.rel.through and not cls._meta.abstract:
-            self.rel.through = create_many_to_many_intermediary_model(self, cls)
-
         # Add the descriptor for the m2m relation
         setattr(cls, self.name, ReverseManyRelatedObjectsDescriptor(self))
 
@@ -976,8 +933,11 @@ class ManyToManyField(RelatedField, Field):
         # work correctly.
         if isinstance(self.rel.through, basestring):
             def resolve_through_model(field, model, cls):
-                field.rel.through = model
+                field.rel.through_model = model
             add_lazy_relation(cls, self, self.rel.through, resolve_through_model)
+        elif self.rel.through:
+            self.rel.through_model = self.rel.through
+            self.rel.through = self.rel.through._meta.object_name
 
         if isinstance(self.rel.to, basestring):
             target = self.rel.to
@@ -986,17 +946,15 @@ class ManyToManyField(RelatedField, Field):
         cls._meta.duplicate_targets[self.column] = (target, "m2m")
 
     def contribute_to_related_class(self, cls, related):
-        # Internal M2Ms (i.e., those with a related name ending with '+')
-        # don't get a related descriptor.
-        if not self.rel.is_hidden():
+        # m2m relations to self do not have a ManyRelatedObjectsDescriptor,
+        # as it would be redundant - unless the field is non-symmetrical.
+        if related.model != related.parent_model or not self.rel.symmetrical:
+            # Add the descriptor for the m2m relation
             setattr(cls, related.get_accessor_name(), ManyRelatedObjectsDescriptor(related))
 
         # Set up the accessors for the column names on the m2m table
-        self.m2m_column_name = curry(self._get_m2m_attr, related, 'column')
-        self.m2m_reverse_name = curry(self._get_m2m_reverse_attr, related, 'column')
-
-        self.m2m_field_name = curry(self._get_m2m_attr, related, 'name')
-        self.m2m_reverse_field_name = curry(self._get_m2m_reverse_attr, related, 'name')
+        self.m2m_column_name = curry(self._get_m2m_column_name, related)
+        self.m2m_reverse_name = curry(self._get_m2m_reverse_name, related)
 
     def set_attributes_from_rel(self):
         pass

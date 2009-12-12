@@ -11,7 +11,6 @@ except NameError:
 from django.template import Node, NodeList, Template, Context, Variable
 from django.template import TemplateSyntaxError, VariableDoesNotExist, BLOCK_TAG_START, BLOCK_TAG_END, VARIABLE_TAG_START, VARIABLE_TAG_END, SINGLE_BRACE_START, SINGLE_BRACE_END, COMMENT_TAG_START, COMMENT_TAG_END
 from django.template import get_library, Library, InvalidTemplateLibrary
-from django.template.smartif import IfParser, Literal
 from django.conf import settings
 from django.utils.encoding import smart_str, smart_unicode
 from django.utils.itercompat import groupby
@@ -39,21 +38,9 @@ class CommentNode(Node):
         return ''
 
 class CsrfTokenNode(Node):
+    # This no-op tag exists to allow 1.1.X code to be compatible with Django 1.2
     def render(self, context):
-        csrf_token = context.get('csrf_token', None)
-        if csrf_token:
-            if csrf_token == 'NOTPROVIDED':
-                return mark_safe(u"")
-            else:
-                return mark_safe(u"<div style='display:none'><input type='hidden' name='csrfmiddlewaretoken' value='%s' /></div>" % (csrf_token))
-        else:
-            # It's very probable that the token is missing because of
-            # misconfiguration, so we raise a warning
-            from django.conf import settings
-            if settings.DEBUG:
-                import warnings
-                warnings.warn("A {% csrf_token %} was used in a template, but the context did not provide the value.  This is usually caused by not using RequestContext.")
-            return u''
+        return u''
 
 class CycleNode(Node):
     def __init__(self, cyclevars, variable_name=None):
@@ -228,9 +215,10 @@ class IfEqualNode(Node):
         return self.nodelist_false.render(context)
 
 class IfNode(Node):
-    def __init__(self, var, nodelist_true, nodelist_false=None):
+    def __init__(self, bool_exprs, nodelist_true, nodelist_false, link_type):
+        self.bool_exprs = bool_exprs
         self.nodelist_true, self.nodelist_false = nodelist_true, nodelist_false
-        self.var = var
+        self.link_type = link_type
 
     def __repr__(self):
         return "<If node>"
@@ -250,10 +238,28 @@ class IfNode(Node):
         return nodes
 
     def render(self, context):
-        if self.var.eval(context):
-            return self.nodelist_true.render(context)
-        else:
+        if self.link_type == IfNode.LinkTypes.or_:
+            for ifnot, bool_expr in self.bool_exprs:
+                try:
+                    value = bool_expr.resolve(context, True)
+                except VariableDoesNotExist:
+                    value = None
+                if (value and not ifnot) or (ifnot and not value):
+                    return self.nodelist_true.render(context)
             return self.nodelist_false.render(context)
+        else:
+            for ifnot, bool_expr in self.bool_exprs:
+                try:
+                    value = bool_expr.resolve(context, True)
+                except VariableDoesNotExist:
+                    value = None
+                if not ((value and not ifnot) or (ifnot and not value)):
+                    return self.nodelist_false.render(context)
+            return self.nodelist_true.render(context)
+
+    class LinkTypes:
+        and_ = 0,
+        or_ = 1
 
 class RegroupNode(Node):
     def __init__(self, target, expression, var_name):
@@ -523,6 +529,7 @@ def cycle(parser, token):
 cycle = register.tag(cycle)
 
 def csrf_token(parser, token):
+    # This no-op tag exists to allow 1.1.X code to be compatible with Django 1.2
     return CsrfTokenNode()
 register.tag(csrf_token)
 
@@ -743,27 +750,6 @@ def ifnotequal(parser, token):
     return do_ifequal(parser, token, True)
 ifnotequal = register.tag(ifnotequal)
 
-class TemplateLiteral(Literal):
-    def __init__(self, value, text):
-        self.value = value
-        self.text = text # for better error messages
-
-    def display(self):
-        return self.text
-
-    def eval(self, context):
-        return self.value.resolve(context, ignore_failures=True)
-
-class TemplateIfParser(IfParser):
-    error_class = TemplateSyntaxError
-
-    def __init__(self, parser, *args, **kwargs):
-        self.template_parser = parser
-        return super(TemplateIfParser, self).__init__(*args, **kwargs)
-
-    def create_var(self, value):
-        return TemplateLiteral(self.template_parser.compile_filter(value), value)
-
 #@register.tag(name="if")
 def do_if(parser, token):
     """
@@ -808,21 +794,47 @@ def do_if(parser, token):
             There are some athletes and absolutely no coaches.
         {% endif %}
 
-    Comparison operators are also available, and the use of filters is also
-    allowed, for example:
+    ``if`` tags do not allow ``and`` and ``or`` clauses with the same tag,
+    because the order of logic would be ambigous. For example, this is
+    invalid::
 
-        {% if articles|length >= 5 %}...{% endif %}
+        {% if athlete_list and coach_list or cheerleader_list %}
 
-    Arguments and operators _must_ have a space between them, so
-    ``{% if 1>2 %}`` is not a valid if tag.
+    If you need to combine ``and`` and ``or`` to do advanced logic, just use
+    nested if tags. For example::
 
-    All supported operators are: ``or``, ``and``, ``in``, ``==`` (or ``=``),
-    ``!=``, ``>``, ``>=``, ``<`` and ``<=``.
-
-    Operator precedence follows Python.
+        {% if athlete_list %}
+            {% if coach_list or cheerleader_list %}
+                We have athletes, and either coaches or cheerleaders!
+            {% endif %}
+        {% endif %}
     """
-    bits = token.split_contents()[1:]
-    var = TemplateIfParser(parser, bits).parse()
+    bits = token.contents.split()
+    del bits[0]
+    if not bits:
+        raise TemplateSyntaxError("'if' statement requires at least one argument")
+    # Bits now looks something like this: ['a', 'or', 'not', 'b', 'or', 'c.d']
+    bitstr = ' '.join(bits)
+    boolpairs = bitstr.split(' and ')
+    boolvars = []
+    if len(boolpairs) == 1:
+        link_type = IfNode.LinkTypes.or_
+        boolpairs = bitstr.split(' or ')
+    else:
+        link_type = IfNode.LinkTypes.and_
+        if ' or ' in bitstr:
+            raise TemplateSyntaxError, "'if' tags can't mix 'and' and 'or'"
+    for boolpair in boolpairs:
+        if ' ' in boolpair:
+            try:
+                not_, boolvar = boolpair.split()
+            except ValueError:
+                raise TemplateSyntaxError, "'if' statement improperly formatted"
+            if not_ != 'not':
+                raise TemplateSyntaxError, "Expected 'not' in if statement"
+            boolvars.append((True, parser.compile_filter(boolvar)))
+        else:
+            boolvars.append((False, parser.compile_filter(boolpair)))
     nodelist_true = parser.parse(('else', 'endif'))
     token = parser.next_token()
     if token.contents == 'else':
@@ -830,7 +842,7 @@ def do_if(parser, token):
         parser.delete_first_token()
     else:
         nodelist_false = NodeList()
-    return IfNode(var, nodelist_true, nodelist_false)
+    return IfNode(boolvars, nodelist_true, nodelist_false, link_type)
 do_if = register.tag("if", do_if)
 
 #@register.tag

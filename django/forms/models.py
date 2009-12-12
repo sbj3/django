@@ -319,7 +319,9 @@ class BaseModelForm(BaseForm):
             if self.instance.pk is not None:
                 qs = qs.exclude(pk=self.instance.pk)
 
-            if qs.exists():
+            # This cute trick with extra/values is the most efficient way to
+            # tell if a particular query returns any results.
+            if qs.extra(select={'a': 1}).values('a').order_by():
                 if len(unique_check) == 1:
                     self._errors[unique_check[0]] = ErrorList([self.unique_error_message(unique_check)])
                 else:
@@ -352,7 +354,9 @@ class BaseModelForm(BaseForm):
             if self.instance.pk is not None:
                 qs = qs.exclude(pk=self.instance.pk)
 
-            if qs.exists():
+            # This cute trick with extra/values is the most efficient way to
+            # tell if a particular query returns any results.
+            if qs.extra(select={'a': 1}).values('a').order_by():
                 self._errors[field] = ErrorList([
                     self.date_error_message(lookup_type, field, unique_for)
                 ])

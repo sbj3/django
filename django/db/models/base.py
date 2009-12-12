@@ -3,6 +3,11 @@ import types
 import sys
 import os
 from itertools import izip
+try:
+    set
+except NameError:
+    from sets import Set as set     # Python 2.3 fallback.
+
 import django.db.models.manager     # Imported to register signal handler.
 from django.core.exceptions import ObjectDoesNotExist, MultipleObjectsReturned, FieldError
 from django.db.models.fields import AutoField, FieldDoesNotExist
@@ -16,6 +21,7 @@ from django.db.models.loading import register_models, get_model
 from django.utils.functional import curry
 from django.utils.encoding import smart_str, force_unicode, smart_unicode
 from django.conf import settings
+
 
 class ModelBase(type):
     """
@@ -230,6 +236,7 @@ class ModelBase(type):
 
         signals.class_prepared.send(sender=cls)
 
+
 class Model(object):
     __metaclass__ = ModelBase
     _deferred = False
@@ -437,7 +444,7 @@ class Model(object):
         else:
             meta = cls._meta
 
-        if origin and not meta.auto_created:
+        if origin:
             signals.pre_save.send(sender=origin, instance=self, raw=raw)
 
         # If we are in a raw save, save the object exactly as presented.
@@ -476,7 +483,7 @@ class Model(object):
             if pk_set:
                 # Determine whether a record with the primary key already exists.
                 if (force_update or (not force_insert and
-                        manager.filter(pk=pk_val).exists())):
+                        manager.filter(pk=pk_val).extra(select={'a': 1}).values('a').order_by())):
                     # It does already exist, so do an UPDATE.
                     if force_update or non_pks:
                         values = [(f, None, (raw and getattr(self, f.attname) or f.pre_save(self, False))) for f in non_pks]
@@ -510,7 +517,7 @@ class Model(object):
                     setattr(self, meta.pk.attname, result)
             transaction.commit_unless_managed()
 
-        if origin and not meta.auto_created:
+        if origin:
             signals.post_save.send(sender=origin, instance=self,
                 created=(not record_exists), raw=raw)
 
@@ -547,12 +554,7 @@ class Model(object):
                         rel_descriptor = cls.__dict__[rel_opts_name]
                         break
                 else:
-                    # in the case of a hidden fkey just skip it, it'll get
-                    # processed as an m2m
-                    if not related.field.rel.is_hidden():
-                        raise AssertionError("Should never get here.")
-                    else:
-                        continue
+                    raise AssertionError("Should never get here.")
                 delete_qs = rel_descriptor.delete_manager(self).all()
                 for sub_obj in delete_qs:
                     sub_obj._collect_sub_objects(seen_objs, self.__class__, related.field.null)

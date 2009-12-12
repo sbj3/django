@@ -3,7 +3,6 @@ from django.conf import settings
 from django.contrib import admin
 from django.contrib.auth.forms import UserCreationForm, UserChangeForm, AdminPasswordChangeForm
 from django.contrib.auth.models import User, Group
-from django.contrib import messages
 from django.core.exceptions import PermissionDenied
 from django.http import HttpResponseRedirect, Http404
 from django.shortcuts import render_to_response, get_object_or_404
@@ -68,13 +67,12 @@ class UserAdmin(admin.ModelAdmin):
                 msg = _('The %(name)s "%(obj)s" was added successfully.') % {'name': 'user', 'obj': new_user}
                 self.log_addition(request, new_user)
                 if "_addanother" in request.POST:
-                    messages.success(request, msg)
+                    request.user.message_set.create(message=msg)
                     return HttpResponseRedirect(request.path)
                 elif '_popup' in request.REQUEST:
                     return self.response_add(request, new_user)
                 else:
-                    messages.success(request, msg + ' ' +
-                                     ugettext("You may edit it again below."))
+                    request.user.message_set.create(message=msg + ' ' + ugettext("You may edit it again below."))
                     return HttpResponseRedirect('../%s/' % new_user.id)
         else:
             form = self.add_form()
@@ -106,7 +104,7 @@ class UserAdmin(admin.ModelAdmin):
             if form.is_valid():
                 new_user = form.save()
                 msg = ugettext('Password changed successfully.')
-                messages.success(request, msg)
+                request.user.message_set.create(message=msg)
                 return HttpResponseRedirect('..')
         else:
             form = self.change_password_form(user)

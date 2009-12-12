@@ -105,9 +105,6 @@ class Anchor(models.Model):
 
     data = models.CharField(max_length=30)
 
-    class Meta:
-        ordering = ('id',)
-
 class UniqueAnchor(models.Model):
     """This is a model that can be used as
     something for other models to point at"""
@@ -138,7 +135,7 @@ class FKDataToO2O(models.Model):
 
 class M2MIntermediateData(models.Model):
     data = models.ManyToManyField(Anchor, null=True, through='Intermediate')
-
+    
 class Intermediate(models.Model):
     left = models.ForeignKey(M2MIntermediateData)
     right = models.ForeignKey(Anchor)
@@ -245,7 +242,7 @@ class AbstractBaseModel(models.Model):
 
 class InheritAbstractModel(AbstractBaseModel):
     child_data = models.IntegerField()
-
+    
 class BaseModel(models.Model):
     parent_data = models.IntegerField()
 
@@ -255,3 +252,4 @@ class InheritBaseModel(BaseModel):
 class ExplicitInheritBaseModel(BaseModel):
     parent = models.OneToOneField(BaseModel)
     child_data = models.IntegerField()
+    
